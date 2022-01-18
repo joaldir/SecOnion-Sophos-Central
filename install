@@ -1,0 +1,213 @@
+#!/bin/bash
+
+# Check for prerequisites
+if [ "$(id -u)" -ne 0 ]; then
+    echo "This script must be run using sudo!"
+    exit 1
+fi
+
+# Check if args supplied (for automated testing purposes)
+if [ "$#" -ne 3 ];
+then
+  PROMPT=1 
+else
+  PROMPT=0
+  username=$1
+  password=$2
+  apiuser=$3
+fi
+
+SOPHOSCT_PATH="/opt/so/conf/sophoscentral"
+
+FB_INPUT="yes"
+
+# Copy Velociraptor config
+mkdir -p /opt/so/saltstack/local/salt/velociraptor
+cp -av salt/velociraptor/* /opt/so/saltstack/local/salt/velociraptor
+
+# Copy firewall config
+cp -av salt/firewall/* /opt/so/saltstack/local/salt/firewall
+
+# Filebeat config
+#cp -av salt/filebeat/* /opt/so/saltstack/local/salt/filebeat
+cp /opt/so/saltstack/default/salt/filebeat/init.sls /opt/so/saltstack/local/salt/filebeat/init.sls
+sed -i '/- \/etc\/ssl.*/a \ \ \ \ \ \ - \/opt\/so\/conf\/velociraptor\/server_artifacts:\/velociraptor\/:ro' /opt/so/saltstack/local/salt/filebeat/init.sls
+
+cat <<EOF >> /opt/so/saltstack/local/pillar/minions/$(salt-call grains.get id --out=json | jq -r .local).sls
+filebeat:
+  config:
+    inputs:
+      - type: log
+        paths:
+          - /velociraptor/Custom.Flows.Write/*.json
+        fields:
+          module: velociraptor
+          pipeline: velociraptor
+        processors:
+          - drop_fields:
+              fields: '["source", "prospector", "input", "offset", "beat"]'
+
+        fields_under_root: true
+        clean_removed: false
+        close_removed: false
+EOF
+
+
+# Copy nginx config
+cp salt/nginx/etc/nginx.conf /opt/so/saltstack/local/salt/nginx/etc/nginx.conf
+
+# Copy SOC config
+cp /opt/so/saltstack/default/salt/soc/files/soc/menu.actions.json /opt/so/saltstack/local/salt/soc/files/soc/
+sed -i '$ d' /opt/so/saltstack/local/salt/soc/files/soc/menu.actions.json
+echo ",{ \"name\": \"Velociraptor\", \"description\": \"Velociraptor Client Pivot\", \"icon\": \"fa-external-link-alt\", \"target\": \"_blank\",\"links\": [\"/velociraptor/app/index.html?#/search/{:client.id}\"]}]" >> /opt/so/saltstack/local/salt/soc/files/soc/menu.actions.json
+cp /opt/so/saltstack/default/salt/soc/files/soc/tools.json /opt/so/saltstack/local/salt/soc/files/soc
+sed -i 's|]|,{ "name": "Velociraptor", "description": "toolVelociraptorHelp", "icon": "fa-external-link-alt", "target": "so-velociraptor", "link": "/velociraptor/" },{ "name": "n8n", "description": "tooln8nHelp", "icon": "fa-external-link-alt", "target": "so-n8n", "link": "/n8n/" }]|' /opt/so/saltstack/local/salt/soc/files/soc/tools.json
+
+# Copy utility scripts
+cp -av salt/common/tools/sbin/so-velociraptor-* /opt/so/saltstack/default/salt/common/tools/sbin/
+
+# Copy ES Ingest config, Logstash config (if applicable), and template
+if [[ "$FB_INPUT" == "yes" ]]; then
+    cp salt/elasticsearch/files/ingest/velociraptor.fb_input /opt/so/saltstack/local/salt/elasticsearch/files/ingest/velociraptor
+    cp salt/logstash/pipelines/config/custom/9501_output_velociraptor.conf.jinja /opt/so/saltstack/local/salt/logstash/pipelines/config/custom/9501_output_velociraptor.conf.jinja
+else
+    cp salt/elasticsearch/files/ingest/velociraptor.es_input /opt/so/saltstack/local/salt/elasticsearch/files/ingest/velociraptor
+fi
+cp salt/elasticsearch/templates/custom/so-velociraptor-template.json /opt/so/saltstack/local/salt/elasticsearch/templates/custom/so-velociraptor-template.json
+
+# Modify templates so Velociraptor will inherit mappings
+cp /opt/so/saltstack/default/salt/elasticsearch/templates/so/so-common-template.json.jinja /opt/so/saltstack/local/salt/elasticsearch/templates/so/so-common-template.json.jinja
+sed -i 's|\"so-playbook-\*\"|\"so-playbook-*\",\ \"so-velociraptor-\*\"|' /opt/so/saltstack/local/salt/elasticsearch/templates/so/so-common-template.json.jinja
+
+# Copy pillar stuff for ES and Logstash config
+for i in elasticsearch logstash; do
+    cp -av pillar/$i/* /opt/so/saltstack/local/pillar/$i
+done
+
+# Edit minion pillar to include Velociraptor firewwall config
+cat << EOF >> /opt/so/saltstack/local/pillar/minions/*.sls
+firewall:
+  assigned_hostgroups:
+    chain:
+      DOCKER-USER:
+        hostgroups:
+          velociraptor:
+            portgroups:
+              - portgroups.velociraptor
+EOF
+
+# Add firewall hostgroup for Velociraptor
+/usr/sbin/so-firewall addhostgroup velociraptor
+
+# Restart ES to load new config
+so-elasticsearch-restart --force
+
+# Restart Logstash to load output
+so-logstash-restart --force
+
+# Restart SOC
+so-soc-restart --force
+
+# Apply common state to pull in utility scripts
+salt "*" saltutil.kill_all_jobs && salt-call state.apply common
+
+# Start Velociraptor
+so-velociraptor-start --force
+
+echo "Waiting..."
+sleep 45s 
+
+# Adjust Velociraptor config
+CUSTOM_ARTIFACT_DIR="/opt/so/conf/velociraptor/artifact_definitions/Custom"
+mkdir -p $CUSTOM_ARTIFACT_DIR/Flows
+mkdir -p $CUSTOM_ARTIFACT_DIR/Server/Automation
+cp velociraptor/artifacts/Custom.Flows.Write $CUSTOM_ARTIFACT_DIR/Flows/Write.yaml
+cp velociraptor/artifacts/Custom.Server.Automation.Quarantine $CUSTOM_ARTIFACT_DIR/Server/Automation/Quarantine.yaml
+chmod 700 -R $CUSTOM_ARTIFACT_DIR
+cp velociraptor/server_monitoring.json.db /opt/so/conf/velociraptor/config/
+chmod 640 /opt/so/conf/velociraptor/config/server_monitoring.json.db
+
+# Re-generate frontend cert
+mv /opt/so/conf/velociraptor/server.config.yaml /tmp/server.config.yaml
+/opt/so/conf/velociraptor/velociraptor --config /tmp/server.config.yaml config rotate_key > /opt/so/conf/velociraptor/server.config.yaml
+
+# Restart Filebeat
+so-filebeat-restart --force
+
+# Restart Velociraptor
+so-velociraptor-restart --force
+
+# Configure user/pass/role
+echo "Waiting for Velociraptor to initialize..."
+sleep 15s
+
+if [ "$PROMPT" -eq 1 ];
+then
+  echo "Please provide an administrative username, then press[ENTER]:"
+  read username
+  echo "Please provide a password for the administrative user, then press [ENTER]:"
+  while true; do
+    read -s -p "Password: " password
+    echo
+    read -s -p "Password (again): " password2
+    echo
+    [ "$password" = "$password2" ] && break
+    echo "Please ensure passwords match!"
+  done
+fi
+
+# Configure administrative user/pass for Velociraptor
+echo "Configuring administrative username and password for Velociraptor..."
+docker exec so-velociraptor /velociraptor/velociraptor --config server.config.yaml user add $username $password --role administrator
+
+### Configure n8n
+# Copy n8n config
+mkdir -p /opt/so/saltstack/local/salt/n8n
+cp -av salt/n8n/* /opt/so/saltstack/local/salt/n8n
+
+# Copy utility scripts
+cp -av salt/common/tools/sbin/so-n8n-* /opt/so/saltstack/default/salt/common/tools/sbin/
+
+# Restart nginx to load new config
+so-nginx-restart --force
+
+# Apply common state to pull in utility scripts
+salt-call saltutil.kill_all_jobs && salt-call state.apply common
+
+# Start n8n
+so-n8n-start --force
+
+# Copy application.conf file into place for TheHive and restart
+cp salt/thehive/etc/application.conf /opt/so/saltstack/local/salt/thehive/etc/
+so-thehive-restart --force
+
+# Copy top file
+cp salt/top.sls /opt/so/saltstack/local/salt/top.sls
+
+## Velocirator API config
+if [ "$PROMPT" -eq 1 ];
+then
+  echo "Please provide a username for the Velociraptor API connection, then press[ENTER]:"
+  read apiuser
+fi
+
+cd $VELO_PATH
+
+# Create API config
+echo "Creating Velociraptor API config..."
+./velociraptor --config server.config.yaml config api_client --name $apiuser --role administrator $N8N_PATH/api_client.yaml || true
+echo
+
+# Replace 0.0.0.0 with our MGR ip
+echo "Ensuring correct manager IP is set..."
+VELOSERVERIP=$(salt-call pillar.get global:managerip --out json | jq -r '.[]')
+sed -i "s|0.0.0.0|$VELOSERVERIP|" $N8N_PATH/api_client.yaml
+
+# Set perms for API config
+echo "Ensuring correct permissions are set for Velociraptor API config..."
+chmod 644 $N8N_PATH/api_client.yaml
+
+echo
+echo "Done!"
+echo "Access n8n by navigating to https://MANAGERIP/n8n -- NOTE: A small bug about a session ID may appear after authenticating to SOC.  If so, refresh the page to resolve it."
+echo "Access Velociraptor by navigating to https://MANAGERIP/velociraptor"
