@@ -1,29 +1,33 @@
-{% set MANAGER = salt['grains.get']('master') %}
-{% set MANAGER_URL = salt['pillar.get']('global:url_base', '') %}
-{% set MANAGER_IP = salt['pillar.get']('global:managerip', '') %}
+{%- set url_base = salt['pillar.get']('global:url_base') %}
+velociraptorgroup:
+  group.present:
+    - name: velociraptor
+    - gid: 989
 
-sophoscentraldir:
-  file.directory:
-    - name: /opt/so/conf/sophos-central
-    - user: 1002
-    - group: 1002
-    - makedirs: True
+velociraptor:
+  user.present:
+    - uid: 989
+    - gid: 989
+    - home: /opt/so/conf/velociraptor
 
-so-sophos-central:
+#velociraptorconfdir:
+#  file.directory:
+#    - name: /opt/so/conf/velociraptor
+#    - user: 939
+#    - group: 939
+#    - makedirs: True
+
+so-sophos-siem:
   docker_container.running:
     - image: joaldir/so-sophos-siem
-    - hostname: sophos-central
-    - name: so-sophos-central
-    - environment:
-      - SOPHOSSI_HOST=0.0.0.0
-      - SOPHOSSI_PORT=5678
-      - SUBFOLDER=sophossiem
-      - N8N_PATH=/sophossiem/
-      - DATA_FOLDER=/root/sophossiem/
     - binds:
-      - /opt/so/conf/sophossiem:/home/sophossiem/.sophossiem:rw
-      - /opt/sophos/config.ini:/opt/Sophos-Central-SIEM-Integration/config.ini:root
-      - /opt/sophos/state:/opt/Sophos-Central-SIEM-Integration/state
-      - /opt/sophos/log:/opt/Sophos-Central-SIEM-Integration/log
-    - extra_hosts:
-      - {{MANAGER_URL}}:{{MANAGER_IP}}
+      - /opt/so/conf/velociraptor:/velociraptor:rw
+    - port_bindings:
+      - 0.0.0.0:8889:8889
+      - 0.0.0.0:8001:8001
+      - 0.0.0.0:8000:8000
+    - environment:
+      - VELOX_SERVER_URL=https://{{ url_base }}:8000/
+      - VELOX_FRONTEND_HOSTNAME={{ url_base }}
+
+# verificar o start do docker

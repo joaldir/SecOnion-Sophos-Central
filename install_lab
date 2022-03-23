@@ -17,7 +17,8 @@ else
   apiuser=$3
 fi
 
-SOPHOSCT_PATH="/opt/so/conf/sophoscentral"
+VELO_PATH="/opt/so/conf/velociraptor"
+N8N_PATH="/opt/so/conf/n8n"
 
 FB_INPUT="yes"
 
